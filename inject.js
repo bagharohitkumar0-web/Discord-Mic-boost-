@@ -1,120 +1,58 @@
-// inject.js — runs in the MAIN world, i.e. the actual page context Discord's
-// own code runs in. This lets us override navigator.mediaDevices.getUserMedia
-// so that when Discord asks for your microphone, it gets a processed stream
-// (gain boost + parametric EQ) instead of the raw one.
-
-(function () {
-  const FILTER_TYPE_MAP = {
-    PK: 'peaking',
-    PEQ: 'peaking',
-    LSC: 'lowshelf',
-    LS: 'lowshelf',
-    HSC: 'highshelf',
-    HS: 'highshelf',
-    NO: 'notch',
-    LP: 'lowpass',
-    HP: 'highpass',
-    LPQ: 'lowpass',
-    HPQ: 'highpass',
-    AP: 'allpass'
-  };
-
-  let currentConfig = { preampDb: 0, filters: [] };
-  let activeChain = null; // holds live nodes so we can update them without restarting the call
-
-  window.addEventListener('MIC_EQ_CONFIG_UPDATE', (e) => {
-    currentConfig = e.detail || { preampDb: 0, filters: [] };
-    if (activeChain) applyConfigToChain(activeChain, currentConfig);
-  });
-
-  function applyConfigToChain(chain, config) {
-    const { audioCtx, gainNode, filterNodes, filterChainInput, filterChainOutput } = chain;
-
-    // Update preamp gain
-    const gainValue = Math.pow(10, (config.preampDb || 0) / 20);
-    gainNode.gain.setTargetAtTime(gainValue, audioCtx.currentTime, 0.01);
-
-    // Rebuild filter chain if the number/type of filters changed
-    const needsRebuild = filterNodes.length !== (config.filters || []).length;
-    if (needsRebuild) {
-      // disconnect old filters
-      filterChainInput.disconnect();
-      filterNodes.forEach((f) => f.disconnect());
-      chain.filterNodes = buildFilters(audioCtx, config.filters || []);
-      connectFilterChain(filterChainInput, chain.filterNodes, filterChainOutput);
-    } else {
-      // just update params in place
-      (config.filters || []).forEach((f, i) => {
-        const node = filterNodes[i];
-        node.type = FILTER_TYPE_MAP[f.type] || 'peaking';
-        node.frequency.setTargetAtTime(f.freq, audioCtx.currentTime, 0.01);
-        node.gain.setTargetAtTime(f.gain, audioCtx.currentTime, 0.01);
-        node.Q.setTargetAtTime(f.q || 0.71, audioCtx.currentTime, 0.01);
-      });
-    }
-  }
-
-  function buildFilters(audioCtx, filters) {
-    return filters.map((f) => {
-      const node = audioCtx.createBiquadFilter();
-      node.type = FILTER_TYPE_MAP[f.type] || 'peaking';
-      node.frequency.value = f.freq;
-      node.gain.value = f.gain;
-      node.Q.value = f.q || 0.71;
-      return node;
-    });
-  }
-
-  function connectFilterChain(input, filterNodes, output) {
-    let node = input;
-    for (const f of filterNodes) {
-      node.connect(f);
-      node = f;
-    }
-    node.connect(output);
-  }
-
-  function processStream(originalStream, config) {
-    const audioCtx = new AudioContext();
-    const source = audioCtx.createMediaStreamSource(originalStream);
-    const gainNode = audioCtx.createGain();
-    gainNode.gain.value = Math.pow(10, (config.preampDb || 0) / 20);
-
-    const filterNodes = buildFilters(audioCtx, config.filters || []);
-    const destination = audioCtx.createMediaStreamDestination();
-
-    source.connect(gainNode);
-    connectFilterChain(gainNode, filterNodes, destination);
-
-    activeChain = {
-      audioCtx,
-      gainNode,
-      filterNodes,
-      filterChainInput: gainNode,
-      filterChainOutput: destination
-    };
-
-    // Keep original video tracks (if any) alongside the processed audio track
-    const processedStream = destination.stream;
-    originalStream.getVideoTracks().forEach((track) => processedStream.addTrack(track));
-
-    return processedStream;
-  }
-
-  const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-
-  navigator.mediaDevices.getUserMedia = async function (constraints) {
-    const stream = await originalGetUserMedia(constraints);
-    if (constraints && constraints.audio) {
-      try {
-        return processStream(stream, currentConfig);
-      } catch (err) {
-        console.error('[Mic EQ Boost] Failed to process stream, falling back to raw mic:', err);
-        return stream;
-      }
-    }
-    return stream;
-  };
-
-  console.log('[Mic EQ Boost] getUserMedia override active.');
+(function() {
+'use strict';
+let audioCtx = null;
+let gainNode = null;
+let eqNodes = [];
+const BASS_FREQ = 100;
+const MID_FREQ = 1000;
+const TREBLE_FREQ = 3000;
+window.DISCORD_EQ_CONFIG = { gain: 2.0, bass: 0, mid: 0, treble: 0 };
+const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+navigator.mediaDevices.getUserMedia = async function(...args) {
+const stream = await originalGetUserMedia(...args);
+if (stream.getAudioTracks().length === 0) return stream;
+try {
+if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+const source = audioCtx.createMediaStreamSource(stream);
+gainNode = audioCtx.createGain();
+gainNode.gain.value = window.DISCORD_EQ_CONFIG.gain;
+const bassFilter = audioCtx.createBiquadFilter();
+bassFilter.type = 'lowshelf';
+bassFilter.frequency.value = BASS_FREQ;
+bassFilter.gain.value = window.DISCORD_EQ_CONFIG.bass;
+const midFilter = audioCtx.createBiquadFilter();
+midFilter.type = 'peaking';
+midFilter.frequency.value = MID_FREQ;
+midFilter.Q.value = 1.0;
+midFilter.gain.value = window.DISCORD_EQ_CONFIG.mid;
+const trebleFilter = audioCtx.createBiquadFilter();
+trebleFilter.type = 'highshelf';
+trebleFilter.frequency.value = TREBLE_FREQ;
+trebleFilter.gain.value = window.DISCORD_EQ_CONFIG.treble;
+eqNodes = [bassFilter, midFilter, trebleFilter];
+source.connect(bassFilter);
+bassFilter.connect(midFilter);
+midFilter.connect(trebleFilter);
+trebleFilter.connect(gainNode);
+const destination = audioCtx.createMediaStreamDestination();
+gainNode.connect(destination);
+const processedStream = destination.stream;
+stream.getVideoTracks().forEach(track => processedStream.addTrack(track));
+return processedStream;
+} catch (err) {
+console.error("[Discord EQ Extension] Audio processing failed:", err);
+return stream;
+}
+};
+window.addEventListener("message", (event) => {
+if (event.source !== window || !event.data || event.data.type !== "DISCORD_EQ_UPDATE") return;
+const { gain, bass, mid, treble } = event.data.payload;
+window.DISCORD_EQ_CONFIG = { gain, bass, mid, treble };
+if (gainNode) gainNode.gain.value = gain;
+if (eqNodes.length === 3) {
+eqNodes[0].gain.value = bass;
+eqNodes[1].gain.value = mid;
+eqNodes[2].gain.value = treble;
+}
+});
 })();
